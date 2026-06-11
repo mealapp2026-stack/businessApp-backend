@@ -41,8 +41,12 @@ func (s *Server) Router() *gin.Engine {
 	router.POST("/api/auth/login", s.login)
 
 	api := router.Group("/api", authMiddleware(s.jwtSecret))
+	api.Use(s.loadIdentity)
 	api.GET("/me", s.me)
 	api.PUT("/profile", s.updateProfile)
+	api.GET("/staff", s.listStaff)
+	api.POST("/staff", s.createStaff)
+	api.PUT("/staff/:id", s.updateStaff)
 	api.GET("/customers", s.listCustomers)
 	api.POST("/customers", s.createCustomer)
 	api.PUT("/customers/:id", s.updateCustomer)
@@ -72,6 +76,7 @@ func (s *Server) register(c *gin.Context) {
 		return
 	}
 	user := model.User{
+		Name: strings.TrimSpace(req.BusinessName), Role: "owner",
 		Email: strings.ToLower(strings.TrimSpace(req.Email)), PasswordHash: hash,
 		Business: model.BusinessProfile{Name: strings.TrimSpace(req.BusinessName), Phone: req.Phone, Currency: "NGN"},
 	}
@@ -98,7 +103,7 @@ func (s *Server) login(c *gin.Context) {
 		return
 	}
 	user, err := s.store.UserByEmail(c, strings.ToLower(strings.TrimSpace(req.Email)))
-	if err != nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
+	if err != nil || user.Disabled || !auth.CheckPassword(user.PasswordHash, req.Password) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 		return
 	}
@@ -106,6 +111,11 @@ func (s *Server) login(c *gin.Context) {
 }
 
 func (s *Server) respondWithSession(c *gin.Context, user model.User) {
+	user, err := s.userResponse(c, user)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
 	token, err := auth.CreateToken(s.jwtSecret, user.ID.Hex())
 	if err != nil {
 		internalError(c, err)
@@ -114,15 +124,64 @@ func (s *Server) respondWithSession(c *gin.Context, user model.User) {
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": user})
 }
 
-func (s *Server) me(c *gin.Context) {
+func (s *Server) loadIdentity(c *gin.Context) {
 	user, err := s.store.UserByID(c, currentUserID(c))
-	if respondStoreError(c, err) {
+	if err != nil || user.Disabled {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "account is disabled or no longer exists"})
+		return
+	}
+	normalized := normalizeUser(*user)
+	c.Set(currentUserKey, normalized)
+	c.Set(accountIDKey, normalized.AccountID)
+	c.Next()
+}
+
+func normalizeUser(user model.User) model.User {
+	if user.Role == "" {
+		user.Role = "owner"
+	}
+	if user.AccountID.IsZero() {
+		user.AccountID = user.ID
+	}
+	if user.Name == "" && user.Role == "owner" {
+		user.Name = user.Business.Name
+	}
+	return user
+}
+
+func (s *Server) userResponse(c *gin.Context, user model.User) (model.User, error) {
+	user = normalizeUser(user)
+	if user.Role == "staff" {
+		account, err := s.store.UserByID(c, user.AccountID)
+		if err != nil {
+			return model.User{}, err
+		}
+		user.Business = account.Business
+	}
+	return user, nil
+}
+
+func (s *Server) requireOwner(c *gin.Context) bool {
+	if currentUser(c).Role != "owner" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only the account owner can perform this action"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) me(c *gin.Context) {
+	user, err := s.userResponse(c, currentUser(c))
+	if err != nil {
+		internalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, user)
 }
 
 func (s *Server) updateProfile(c *gin.Context) {
+	if !s.requireOwner(c) {
+		return
+	}
 	var profile model.BusinessProfile
 	if err := c.ShouldBindJSON(&profile); err != nil || strings.TrimSpace(profile.Name) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "business name is required"})
@@ -149,14 +208,86 @@ func (s *Server) updateProfile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported currency"})
 		return
 	}
-	if err := s.store.UpdateProfile(c, currentUserID(c), profile); respondStoreError(c, err) {
+	if err := s.store.UpdateProfile(c, currentAccountID(c), profile); respondStoreError(c, err) {
 		return
 	}
 	c.JSON(http.StatusOK, profile)
 }
 
+type createStaffRequest struct {
+	Name     string `json:"name" binding:"required"`
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required,min=8"`
+}
+
+func (s *Server) listStaff(c *gin.Context) {
+	if !s.requireOwner(c) {
+		return
+	}
+	staff, err := s.store.Staff(c, currentAccountID(c))
+	if respondStoreError(c, err) {
+		return
+	}
+	c.JSON(http.StatusOK, staff)
+}
+
+func (s *Server) createStaff(c *gin.Context) {
+	if !s.requireOwner(c) {
+		return
+	}
+	var req createStaffRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		badRequest(c, err)
+		return
+	}
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	staff := model.User{
+		AccountID:    currentAccountID(c),
+		Name:         strings.TrimSpace(req.Name),
+		Email:        strings.ToLower(strings.TrimSpace(req.Email)),
+		PasswordHash: hash,
+		Role:         "staff",
+	}
+	if err := s.store.CreateUser(c, &staff); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "an account with this email already exists"})
+			return
+		}
+		internalError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, staff)
+}
+
+type updateStaffRequest struct {
+	Disabled bool `json:"disabled"`
+}
+
+func (s *Server) updateStaff(c *gin.Context) {
+	if !s.requireOwner(c) {
+		return
+	}
+	id, ok := objectIDParam(c)
+	if !ok {
+		return
+	}
+	var req updateStaffRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		badRequest(c, err)
+		return
+	}
+	if err := s.store.UpdateStaffDisabled(c, currentAccountID(c), id, req.Disabled); respondStoreError(c, err) {
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 func (s *Server) listCustomers(c *gin.Context) {
-	customers, err := s.store.Customers(c, currentUserID(c), c.Query("search"))
+	customers, err := s.store.Customers(c, currentAccountID(c), c.Query("search"))
 	if respondStoreError(c, err) {
 		return
 	}
@@ -183,7 +314,7 @@ func (s *Server) createCustomer(c *gin.Context) {
 		return
 	}
 	customer := model.Customer{
-		UserID: currentUserID(c), Name: strings.TrimSpace(req.Name), Phone: normalizePhone(req.Phone),
+		UserID: currentAccountID(c), Name: strings.TrimSpace(req.Name), Phone: normalizePhone(req.Phone),
 		Email: strings.TrimSpace(req.Email), Address: strings.TrimSpace(req.Address),
 	}
 	if err := s.store.CreateCustomer(c, &customer); err != nil {
@@ -208,7 +339,7 @@ func (s *Server) updateCustomer(c *gin.Context) {
 		return
 	}
 	customer := model.Customer{
-		ID: id, UserID: currentUserID(c), Name: strings.TrimSpace(req.Name), Phone: normalizePhone(req.Phone),
+		ID: id, UserID: currentAccountID(c), Name: strings.TrimSpace(req.Name), Phone: normalizePhone(req.Phone),
 		Email: strings.TrimSpace(req.Email), Address: strings.TrimSpace(req.Address),
 	}
 	if err := s.store.UpdateCustomer(c, customer); respondStoreError(c, err) {
@@ -239,11 +370,11 @@ func (s *Server) createDocument(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customerId"})
 		return
 	}
-	customer, err := s.store.CustomerByID(c, currentUserID(c), customerID)
+	customer, err := s.store.CustomerByID(c, currentAccountID(c), customerID)
 	if respondStoreError(c, err) {
 		return
 	}
-	user, err := s.store.UserByID(c, currentUserID(c))
+	account, err := s.store.UserByID(c, currentAccountID(c))
 	if respondStoreError(c, err) {
 		return
 	}
@@ -262,12 +393,14 @@ func (s *Server) createDocument(c *gin.Context) {
 		issueDate = req.IssueDate.UTC()
 	}
 	document := model.Document{
-		UserID: currentUserID(c), CustomerID: customerID, Type: req.Type,
+		UserID: currentAccountID(c), CustomerID: customerID, Type: req.Type,
 		Number: store.NextDocumentNumber(req.Type), Items: req.Items, Subtotal: subtotal,
 		Discount: req.Discount, Tax: req.Tax, Total: total, Notes: req.Notes,
-		IssueDate: issueDate, DueDate: req.DueDate, BusinessSnapshot: user.Business,
+		IssueDate: issueDate, DueDate: req.DueDate, BusinessSnapshot: account.Business,
 		Customer: model.CustomerSnapshot{Name: customer.Name, Phone: customer.Phone, Email: customer.Email, Address: customer.Address},
 	}
+	creator := currentUser(c)
+	document.CreatedBy = model.CreatorSnapshot{ID: creator.ID, Name: creator.Name, Email: creator.Email}
 	if err := s.store.CreateDocument(c, &document); err != nil {
 		internalError(c, err)
 		return
@@ -290,7 +423,7 @@ func (s *Server) listDocuments(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be invoice or receipt"})
 		return
 	}
-	documents, err := s.store.Documents(c, currentUserID(c), kind, customerID)
+	documents, err := s.store.Documents(c, currentAccountID(c), kind, customerID)
 	if respondStoreError(c, err) {
 		return
 	}
@@ -302,7 +435,7 @@ func (s *Server) getDocument(c *gin.Context) {
 	if !ok {
 		return
 	}
-	document, err := s.store.DocumentByID(c, currentUserID(c), id)
+	document, err := s.store.DocumentByID(c, currentAccountID(c), id)
 	if respondStoreError(c, err) {
 		return
 	}
@@ -333,7 +466,7 @@ func (s *Server) revenue(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "from must be before to"})
 		return
 	}
-	summary, err := s.store.RevenueSummary(c, currentUserID(c), from, to)
+	summary, err := s.store.RevenueSummary(c, currentAccountID(c), from, to)
 	if respondStoreError(c, err) {
 		return
 	}

@@ -60,6 +60,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 		models     []mongo.IndexModel
 	}{
 		{s.users, []mongo.IndexModel{{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}}},
+		{s.users, []mongo.IndexModel{{Keys: bson.D{{Key: "accountId", Value: 1}, {Key: "role", Value: 1}}}}},
 		{s.customers, []mongo.IndexModel{
 			{Keys: bson.D{{Key: "userId", Value: 1}, {Key: "phone", Value: 1}}, Options: options.Index().SetUnique(true)},
 			{Keys: bson.D{{Key: "userId", Value: 1}, {Key: "name", Value: 1}}},
@@ -83,9 +84,33 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 
 func (s *Store) CreateUser(ctx context.Context, user *model.User) error {
 	user.ID = primitive.NewObjectID()
+	if user.AccountID.IsZero() {
+		user.AccountID = user.ID
+	}
 	user.CreatedAt = time.Now().UTC()
 	user.UpdatedAt = user.CreatedAt
 	_, err := s.users.InsertOne(ctx, user)
+	return err
+}
+
+func (s *Store) Staff(ctx context.Context, accountID primitive.ObjectID) ([]model.User, error) {
+	cursor, err := s.users.Find(ctx, bson.M{"accountId": accountID, "role": "staff"}, options.Find().SetSort(bson.D{{Key: "name", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	staff := make([]model.User, 0)
+	err = cursor.All(ctx, &staff)
+	return staff, err
+}
+
+func (s *Store) UpdateStaffDisabled(ctx context.Context, accountID, staffID primitive.ObjectID, disabled bool) error {
+	result, err := s.users.UpdateOne(ctx, bson.M{
+		"_id": staffID, "accountId": accountID, "role": "staff",
+	}, bson.M{"$set": bson.M{"disabled": disabled, "updatedAt": time.Now().UTC()}})
+	if err == nil && result.MatchedCount == 0 {
+		return ErrNotFound
+	}
 	return err
 }
 

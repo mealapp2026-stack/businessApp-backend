@@ -5,12 +5,15 @@ import (
 	"strings"
 
 	"businessapp/backend/internal/auth"
+	"businessapp/backend/internal/model"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 const userIDKey = "userID"
+const accountIDKey = "accountID"
+const currentUserKey = "currentUser"
 
 func authMiddleware(secret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -49,4 +52,12 @@ func cors(origin string) gin.HandlerFunc {
 
 func currentUserID(c *gin.Context) primitive.ObjectID {
 	return c.MustGet(userIDKey).(primitive.ObjectID)
+}
+
+func currentAccountID(c *gin.Context) primitive.ObjectID {
+	return c.MustGet(accountIDKey).(primitive.ObjectID)
+}
+
+func currentUser(c *gin.Context) model.User {
+	return c.MustGet(currentUserKey).(model.User)
 }

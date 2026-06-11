@@ -8,8 +8,12 @@ import (
 
 type User struct {
 	ID           primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	AccountID    primitive.ObjectID `bson:"accountId,omitempty" json:"accountId"`
+	Name         string             `bson:"name,omitempty" json:"name"`
 	Email        string             `bson:"email" json:"email"`
 	PasswordHash string             `bson:"passwordHash" json:"-"`
+	Role         string             `bson:"role,omitempty" json:"role"`
+	Disabled     bool               `bson:"disabled,omitempty" json:"disabled"`
 	Business     BusinessProfile    `bson:"business" json:"business"`
 	CreatedAt    time.Time          `bson:"createdAt" json:"createdAt"`
 	UpdatedAt    time.Time          `bson:"updatedAt" json:"updatedAt"`
@@ -53,6 +57,7 @@ type CustomerSnapshot struct {
 type Document struct {
 	ID               primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	UserID           primitive.ObjectID `bson:"userId" json:"-"`
+	CreatedBy        CreatorSnapshot    `bson:"createdBy" json:"createdBy"`
 	CustomerID       primitive.ObjectID `bson:"customerId" json:"customerId"`
 	Customer         CustomerSnapshot   `bson:"customer" json:"customer"`
 	Type             string             `bson:"type" json:"type"`
@@ -68,6 +73,12 @@ type Document struct {
 	BusinessSnapshot BusinessProfile    `bson:"businessSnapshot" json:"businessSnapshot"`
 	CreatedAt        time.Time          `bson:"createdAt" json:"createdAt"`
 	UpdatedAt        time.Time          `bson:"updatedAt" json:"updatedAt"`
+}
+
+type CreatorSnapshot struct {
+	ID    primitive.ObjectID `bson:"id" json:"id"`
+	Name  string             `bson:"name" json:"name"`
+	Email string             `bson:"email" json:"email"`
 }
 
 type Revenue struct {
